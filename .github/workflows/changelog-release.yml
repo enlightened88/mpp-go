@@ -32,6 +32,6 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
-      - uses: tempoxyz/changelogs@bd50cca508d81505924dfa3997b1696ac2b7b1aa # v0.9.0
+      - uses: tempoxyz/changelogs@b810ec2bdffd21f0d14a4709b4b8ab6f75715246
         with:
           github-token: ${{ steps.app-token.outputs.token }}
