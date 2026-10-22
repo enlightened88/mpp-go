@@ -138,7 +138,14 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			credentials[key] = cred
 		}
 
-		retry.Header.Set(selected.challenge.CredentialHeader(), cred.ToAuthorization())
+		authorization, err := mpp.FormatAuthorizationStrict(cred)
+		if err != nil {
+			if retry.Body != nil {
+				_ = retry.Body.Close()
+			}
+			return nil, err
+		}
+		retry.Header.Set(selected.challenge.CredentialHeader(), authorization)
 		request = retry
 		sentCredential = key
 	}

@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
-	"reflect"
 	"time"
 
 	"github.com/tempoxyz/mpp-go/pkg/mpp"
@@ -13,6 +15,9 @@ import (
 
 // VerifyParams contains the parameters for VerifyOrChallenge.
 type VerifyParams struct {
+	// EnableChallengeNonce opts into unique issuance after every replica has
+	// nonce-aware verification. The default preserves legacy issuance for rollout.
+	EnableChallengeNonce bool
 	// Authorization is the incoming Authorization header value.
 	Authorization string
 	// Intent verifies Credentials for this request.
@@ -79,9 +84,24 @@ func VerifyOrChallenge(ctx context.Context, params VerifyParams) (*VerifyResult,
 	if params.Description != "" {
 		opts = append(opts, mpp.WithDescription(params.Description))
 	}
-	if params.Meta != nil {
-		opts = append(opts, mpp.WithMeta(params.Meta))
+	if _, reserved := params.Meta["_mpp_nonce"]; reserved {
+		return nil, mpp.ErrBadRequest("_mpp_nonce is reserved for challenge issuance")
 	}
+	meta := maps.Clone(params.Meta)
+	if params.EnableChallengeNonce {
+		if meta == nil {
+			meta = make(map[string]string)
+		}
+		nonce := make([]byte, 32)
+		if _, err := rand.Read(nonce); err != nil {
+			return nil, fmt.Errorf("generating challenge nonce: %w", err)
+		}
+		meta["_mpp_nonce"] = hex.EncodeToString(nonce)
+	}
+	if meta != nil {
+		opts = append(opts, mpp.WithMeta(meta))
+	}
+
 	if params.Header != "" {
 		opts = append(opts, mpp.WithHeader(params.Header))
 	}
@@ -191,7 +211,9 @@ func VerifyOrChallenge(ctx context.Context, params VerifyParams) (*VerifyResult,
 			return challengeResultError(challenge, mpp.ErrPaymentExpired(echoed.Expires))
 		}
 	}
-	if !reflect.DeepEqual(echoed.Opaque, challenge.Opaque) {
+	// The nonce is authenticated by the echoed HMAC, not compared with the
+	// fresh challenge. Application metadata must still match exactly.
+	if !maps.Equal(applicationMeta(echoed.Opaque), params.Meta) {
 		return challengeResultError(challenge, mpp.ErrInvalidChallenge(
 			echoed.ID,
 			"credential opaque metadata does not match this route's requirements",
@@ -212,9 +234,12 @@ func VerifyOrChallenge(ctx context.Context, params VerifyParams) (*VerifyResult,
 			if pe.Status != http.StatusPaymentRequired {
 				return nil, pe
 			}
-			return challengeResultError(challenge, pe)
+			if pe.Type == mpp.ErrorTypeInvalidPayload {
+				return challengeResultError(challenge, pe)
+			}
+			return challengeResultError(echoedChallenge, pe)
 		}
-		return challengeResultError(challenge, mpp.ErrVerificationFailed(err.Error()))
+		return challengeResultError(echoedChallenge, mpp.ErrVerificationFailed(err.Error()))
 	}
 
 	// 9. Return result.
@@ -275,4 +300,10 @@ func echoedChallengeOpts(cred *mpp.Credential) []mpp.ChallengeOption {
 		opts = append(opts, mpp.WithHeader(cred.Challenge.Header))
 	}
 	return opts
+}
+
+func applicationMeta(meta map[string]string) map[string]string {
+	result := maps.Clone(meta)
+	delete(result, "_mpp_nonce")
+	return result
 }

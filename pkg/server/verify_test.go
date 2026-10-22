@@ -524,3 +524,45 @@ func TestVerifyOrChallenge_RejectsOpaqueMismatch(t *testing.T) {
 	}
 
 }
+
+func TestChallengeIssuanceNonce(t *testing.T) {
+	params := VerifyParams{Intent: verifyTestIntent{}, Request: map[string]any{"amount": "100"}, Realm: "example.com", SecretKey: "secret", Method: "tempo", Expires: mpp.Expires.Minutes(5), Meta: map[string]string{"order": "one"}, EnableChallengeNonce: true}
+	first, err := VerifyOrChallenge(context.Background(), params)
+	require.NoError(t, err)
+	second, err := VerifyOrChallenge(context.Background(), params)
+	require.NoError(t, err)
+	require.NotEqual(t, first.Challenge.ID, second.Challenge.ID)
+	require.Len(t, first.Challenge.Opaque["_mpp_nonce"], 64)
+	require.Equal(t, map[string]string{"order": "one"}, params.Meta)
+	cred := &mpp.Credential{Challenge: first.Challenge.ToEcho(), Payload: map[string]any{}}
+	params.Authorization = cred.ToAuthorization()
+	result, err := VerifyOrChallenge(context.Background(), params)
+	require.NoError(t, err)
+	require.NotNil(t, result.Receipt)
+	cred.Challenge.Opaque["_mpp_nonce"] = second.Challenge.Opaque["_mpp_nonce"]
+	params.Authorization = cred.ToAuthorization()
+	_, err = VerifyOrChallenge(context.Background(), params)
+	require.Error(t, err)
+	params.Authorization = ""
+	params.Meta["_mpp_nonce"] = "fixed"
+	_, err = VerifyOrChallenge(context.Background(), params)
+	require.Error(t, err)
+}
+
+func TestChallengeNonceStagedRollout(t *testing.T) {
+	params := VerifyParams{Intent: verifyTestIntent{}, Request: map[string]any{"amount": "100"}, Realm: "example.com", SecretKey: "secret", Method: "tempo", Expires: mpp.Expires.Minutes(5)}
+	legacy, err := VerifyOrChallenge(context.Background(), params)
+	require.NoError(t, err)
+	require.Empty(t, legacy.Challenge.Opaque)
+	want := mpp.NewChallenge(params.SecretKey, params.Realm, params.Method, params.Intent.Name(), params.Request, mpp.WithExpires(params.Expires))
+	require.Equal(t, want.ID, legacy.Challenge.ID, "default issuance must match pre-upgrade challenge construction")
+	params.EnableChallengeNonce = true
+	fresh, err := VerifyOrChallenge(context.Background(), params)
+	require.NoError(t, err)
+	require.NotEmpty(t, fresh.Challenge.Opaque["_mpp_nonce"])
+	params.EnableChallengeNonce = false
+	params.Authorization = fresh.Challenge.NewCredential(map[string]any{}).ToAuthorization()
+	result, err := VerifyOrChallenge(context.Background(), params)
+	require.NoError(t, err)
+	require.NotNil(t, result.Receipt)
+}

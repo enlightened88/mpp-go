@@ -52,7 +52,7 @@ func TestTransportRegeneratesInvalidPayloadWithFixedExpiry(t *testing.T) {
 				}
 				payment, err := server.New(rejectingMethod{intent}, "api.example.com", "test-secret-key-minimum-32-byte-secret", opts...)
 				require.NoError(t, err)
-				srv := httptest.NewServer(server.ChargeMiddleware(payment, server.ChargeParams{Amount: "0.50", Expires: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })))
+				srv := httptest.NewServer(server.ChargeMiddleware(payment, server.ChargeParams{EnableChallengeNonce: true, Amount: "0.50", Expires: time.Now().Add(time.Hour).UTC().Format(time.RFC3339)})(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })))
 				defer srv.Close()
 				method := new(regeneratingMethod)
 				resp, err := New([]Method{method}).Get(context.Background(), srv.URL)
@@ -71,8 +71,8 @@ func TestTransportRegeneratesInvalidPayloadWithFixedExpiry(t *testing.T) {
 					assert.Equal(t, []string{"1", "2"}, proofs)
 				}
 				require.NotEmpty(t, ids)
-				for _, id := range ids {
-					assert.Equal(t, ids[0], id)
+				for _, id := range ids[1:] {
+					assert.NotEqual(t, ids[0], id)
 				}
 			})
 		}
@@ -117,4 +117,27 @@ func TestTransportInvalidPayloadResponseClassification(t *testing.T) {
 			assert.Equal(t, tc.calls, method.calls)
 		})
 	}
+}
+
+func TestTransportReusesNoncedCredentialAfterTransientFailure(t *testing.T) {
+	attempts := 0
+	intent, err := server.NewIntent("charge", server.IntentHooks{Verify: func(_ context.Context, _ *mpp.Credential, _ map[string]any) (*mpp.Receipt, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, mpp.ErrVerificationFailed("receipt not visible")
+		}
+		return mpp.Success("tempo", "paid"), nil
+	}})
+	require.NoError(t, err)
+	payment, err := server.New(rejectingMethod{intent}, "api.example.com", "test-secret-key-minimum-32-byte-secret")
+	require.NoError(t, err)
+	srv := httptest.NewServer(server.ChargeMiddleware(payment, server.ChargeParams{EnableChallengeNonce: true, Amount: "0.50", Expires: mpp.Expires.Minutes(5)})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })))
+	defer srv.Close()
+	method := new(regeneratingMethod)
+	resp, err := New([]Method{method}).Get(context.Background(), srv.URL)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, 200, resp.StatusCode)
+	assert.Equal(t, 1, method.calls)
+	assert.Equal(t, 2, attempts)
 }
