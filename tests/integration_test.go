@@ -498,6 +498,7 @@ func TestIntegrationChargeFlow_ProofCredentialZeroAmount(t *testing.T) {
 	client := mppclient.New(
 		[]mppclient.Method{clientMethod},
 		mppclient.WithHTTPClient(&http.Client{Transport: transport}),
+		mppclient.WithTrustedTempoProofRealm(server.URL, "127.0.0.1"),
 	)
 	response, err := client.Get(ctx, server.URL+"/paid-proof")
 	if !assert.NoErrorf(t, err,
@@ -565,6 +566,7 @@ func TestIntegrationChargeFlow_ProofCredentialReplayProtected(t *testing.T) {
 	client := mppclient.New(
 		[]mppclient.Method{clientMethod},
 		mppclient.WithHTTPClient(&http.Client{Transport: transport}),
+		mppclient.WithTrustedTempoProofRealm(server.URL, "127.0.0.1"),
 	)
 	response, err := client.Get(ctx, server.URL+"/paid-proof")
 	if !assert.NoErrorf(t, err,
@@ -983,7 +985,7 @@ func newPaidServer(t *testing.T, rpcURL string, chainID uint64, feePayerSigner *
 		Recipient: integrationRecipient,
 		ChainID:   int64(chainID),
 	})
-	proof := newTestServer(t, proofMethod, integrationRealm, integrationSecretKey)
+	proof := newTestServer(t, proofMethod, "127.0.0.1", integrationSecretKey)
 	splits := newTestServer(t, splitsMethod, integrationRealm, integrationSecretKey)
 
 	mux := http.NewServeMux()
@@ -1040,7 +1042,7 @@ func paidHandlerWithAmount(t *testing.T, payment *mppserver.Mpp, amount string) 
 		}
 
 		if result.IsChallenge() {
-			w.Header().Set("WWW-Authenticate", result.Challenge.ToAuthenticate(integrationRealm))
+			w.Header().Set("WWW-Authenticate", result.Challenge.ToAuthenticate(result.Challenge.Realm))
 			w.WriteHeader(http.StatusPaymentRequired)
 			return
 		}
