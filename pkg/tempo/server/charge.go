@@ -499,6 +499,12 @@ func (i *Intent) validateTransaction(
 		if err != nil {
 			return mpp.ErrVerificationFailed("failed to serialize transaction")
 		}
+		// Hash the canonical envelope that broadcast claims, so the replay
+		// key matches.
+		serialized, err = canonicalBroadcastTransaction(serialized)
+		if err != nil {
+			return mpp.ErrVerificationFailed("failed to serialize transaction")
+		}
 		hash, err := tempotx.ComputeHash(serialized)
 		if err != nil {
 			return mpp.ErrVerificationFailed("failed to compute transaction hash")
@@ -695,6 +701,13 @@ func (i *Intent) broadcastTransaction(
 	if err != nil {
 		return nil, mpp.ErrVerificationFailed("failed to serialize transaction")
 	}
+	// Nodes normalize accepted signature encodings before deriving transaction
+	// hashes. Broadcast the same canonical envelope so replay keys match the
+	// node reference.
+	serialized, err = canonicalBroadcastTransaction(serialized)
+	if err != nil {
+		return nil, mpp.ErrVerificationFailed("failed to serialize transaction")
+	}
 
 	reservedHash := ""
 	if !request.MethodDetails.FeePayer {
@@ -827,6 +840,61 @@ func validateChallengeExpiry(credential *mpp.Credential) error {
 		return mpp.ErrPaymentExpired(expiresValue)
 	}
 	return nil
+}
+
+// keychainV1SignatureType is the legacy Keychain V1 signature type byte.
+const keychainV1SignatureType = 0x03
+
+// canonicalBroadcastTransaction rewrites a secp256k1 sender signature's
+// recovery ID from 0/1 to 27/28, including the inner secp256k1 signature of
+// a keychain envelope. Tempo nodes encode secp256k1 signatures that way when
+// deriving the transaction hash, and so does mppx, while tempo-go serializes
+// 0/1. Hashing and broadcasting the node's encoding keeps the replay key
+// equal to the receipt reference.
+func canonicalBroadcastTransaction(serialized string) (string, error) {
+	raw, err := hexutil.Decode(serialized)
+	if err != nil {
+		return "", err
+	}
+	if len(raw) < 2 || raw[0] != 0x76 {
+		return "", fmt.Errorf("expected a 0x76 Tempo transaction")
+	}
+	content, rest, err := rlp.SplitList(raw[1:])
+	if err != nil {
+		return "", err
+	}
+	if len(rest) != 0 {
+		return "", fmt.Errorf("unexpected trailing bytes after transaction")
+	}
+	var (
+		kind      rlp.Kind
+		signature []byte
+	)
+	for len(content) > 0 {
+		kind, signature, content, err = rlp.Split(content)
+		if err != nil {
+			return "", err
+		}
+	}
+	if kind != rlp.String {
+		return serialized, nil
+	}
+	switch {
+	case len(signature) == 65:
+	case len(signature) == keychain.KeychainSignatureLength &&
+		(signature[0] == keychainV1SignatureType || signature[0] == keychain.KeychainSignatureType):
+		// Keychain envelopes (type || root account || inner signature) wrap a
+		// secp256k1 inner signature at this length, which the node re-encodes
+		// the same way.
+	default:
+		return serialized, nil
+	}
+	// The signature is the transaction's last field, so its recovery ID is
+	// the final byte of the envelope.
+	if recoveryID := signature[len(signature)-1]; recoveryID <= 1 {
+		signature[len(signature)-1] = recoveryID + 27
+	}
+	return hexutil.Encode(raw), nil
 }
 
 func withReplayReleaseError(settlementErr, releaseErr error) error {
