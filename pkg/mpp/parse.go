@@ -318,6 +318,9 @@ func FormatAuthenticate(c *Challenge, realm string) string {
 // empty required auth-params (id, realm, method, intent, request), which would
 // otherwise be omitted and yield a challenge ParseChallenge rejects.
 func FormatAuthenticateStrict(c *Challenge, realm string) (string, error) {
+	if _, err := parseAdvertisedCredentialHeader(c.Header); err != nil {
+		return "", err
+	}
 	return formatAuthenticate(c, realm, true)
 }
 
