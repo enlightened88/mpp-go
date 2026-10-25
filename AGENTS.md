@@ -58,6 +58,10 @@ Low-level data structures in `pkg/mpp` that compose into the core abstractions:
 ```
 pkg/
 ├── client/          # Generic HTTP 402 retry transport
+├── mcp/             # MPP over MCP for the official MCP Go SDK (matches mppx/mcp)
+│   ├── client/      # Payment-aware MCP client middleware
+│   ├── jsonrpc/     # Charge/Compose for raw MCP JSON-RPC messages (mppx Transport.mcp())
+│   └── server/      # Charge/Compose for MCP tool handlers
 ├── mpp/             # Protocol primitives (Challenge, Credential, Receipt, parsing)
 ├── server/          # Generic challenge-or-verify flow
 └── tempo/           # Tempo blockchain support
@@ -88,7 +92,7 @@ payment, err := mppserver.New(method, realm, secret)
 
 When a local variable would shadow the package name, use a short variable name (`c`, `srv`) instead of aliasing the import.
 
-**Exception**: Internal library code in `pkg/tempo/server` and `pkg/tempo/client` must use `mppserver`/`mppclient` aliases because the file's own package name (`server`/`client`) would conflict.
+**Exception**: Internal library code in `pkg/tempo/server`, `pkg/tempo/client`, `pkg/mcp/server` and `pkg/mcp/client` must use `mppserver`/`mppclient` aliases because the file's own package name (`server`/`client`) would conflict.
 
 ## Spec Reference
 
@@ -136,6 +140,12 @@ docker compose up -d                                 # Start local Tempo devnet
 go run ./examples/charge-basic                       # Run charge-basic example
 TEMPO_RPC_URL=http://localhost:8545 make integration  # Run integration tests
 ```
+
+## READMEs
+
+Do not update README files (the root README.md or any example README) unless
+explicitly asked to. Document new APIs in Go doc comments, AGENTS.md and the
+changelog instead.
 
 ## Changelogs
 
