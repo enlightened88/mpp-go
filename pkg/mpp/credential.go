@@ -31,13 +31,6 @@ func (c *Challenge) NewCredential(payload map[string]any, opts ...CredentialOpti
 	return credential
 }
 
-// FromAuthorization parses an Authorization header value into a Credential.
-//
-// Deprecated: Use ParseCredential instead.
-func FromAuthorization(header string) (*Credential, error) {
-	return ParseCredential(header)
-}
-
 // MarshalJSON emits the ergonomic JSON credential shape with a decoded
 // challenge request object instead of the internal base64url string.
 func (c Credential) MarshalJSON() ([]byte, error) {
@@ -80,13 +73,4 @@ func (c *Credential) UnmarshalJSON(data []byte) error {
 		Source:    decoded.Source,
 	}
 	return nil
-}
-
-// ToAuthorization formats this Credential as an Authorization header value.
-// It returns an empty string when c cannot be formatted.
-//
-// Deprecated: Use FormatCredential instead, which returns formatting errors.
-func (c *Credential) ToAuthorization() string {
-	header, _ := formatAuthorization(c)
-	return header
 }

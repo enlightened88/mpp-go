@@ -326,28 +326,6 @@ func FormatChallenge(c *Challenge) (string, error) {
 	return formatAuthenticateStrict(c, c.Realm)
 }
 
-// FormatAuthenticate formats a Challenge as an authentication header value
-// with the given realm. It returns an empty string when c cannot be
-// formatted.
-//
-// Output format: Payment id="...", realm="...", method="...", intent="...", request="..."
-//
-// Deprecated: Use FormatChallenge instead, which writes c.Realm (the realm
-// the challenge ID binds) and returns formatting errors.
-func FormatAuthenticate(c *Challenge, realm string) string {
-	header, _ := formatAuthenticate(c, realm, false)
-	return header
-}
-
-// FormatAuthenticateStrict formats a Challenge as an authentication header value
-// with the given realm, rejecting what FormatChallenge rejects.
-//
-// Deprecated: Use FormatChallenge instead, which writes c.Realm, the realm the
-// challenge ID binds.
-func FormatAuthenticateStrict(c *Challenge, realm string) (string, error) {
-	return formatAuthenticateStrict(c, realm)
-}
-
 func formatAuthenticateStrict(c *Challenge, realm string) (string, error) {
 	if _, err := parseAdvertisedCredentialHeader(c.Header); err != nil {
 		return "", err
@@ -453,8 +431,8 @@ func b64EncodeRequestWithError(request map[string]any) (string, error) {
 }
 
 func escapeQuoted(value string) string {
-	// Strip CR and LF unconditionally so the non-strict FormatAuthenticate can
-	// never emit a header value that splits the HTTP response. FormatAuthenticateStrict
+	// Strip CR and LF unconditionally so the non-strict formatAuthenticate
+	// can never emit a header value that splits the HTTP response. FormatChallenge
 	// rejects such values earlier with an error; this keeps the default path safe too.
 	var builder strings.Builder
 	for len(value) > 0 {
@@ -641,17 +619,6 @@ func validateCredential(c *Credential) error {
 	return nil
 }
 
-// FormatAuthorization formats a Credential as an Authorization header value.
-// It returns an empty string when c cannot be formatted.
-//
-// Output format: Payment <base64url-json>
-//
-// Deprecated: Use FormatCredential instead, which returns formatting errors.
-func FormatAuthorization(c *Credential) string {
-	header, _ := formatAuthorization(c)
-	return header
-}
-
 func formatAuthorization(c *Credential) (string, error) {
 	if c == nil {
 		return "", fmt.Errorf("mpp: credential is nil")
@@ -699,20 +666,6 @@ func formatAuthorization(c *Credential) (string, error) {
 		return "", err
 	}
 	return SchemePayment + " " + base64.RawURLEncoding.EncodeToString(encoded), nil
-}
-
-// FormatAuthorizationStrict formats a credential and enforces the wire size limit.
-//
-// Deprecated: Use FormatCredential instead.
-func FormatAuthorizationStrict(c *Credential) (string, error) {
-	return FormatCredential(c)
-}
-
-// ParsePaymentReceipt parses a Payment-Receipt header value into a Receipt.
-//
-// Deprecated: Use ParseReceipt instead.
-func ParsePaymentReceipt(header string) (*Receipt, error) {
-	return ParseReceipt(header)
 }
 
 // ParseReceipt parses a Payment-Receipt header value into a Receipt. It
@@ -786,20 +739,13 @@ func receiptFromFields(data map[string]any) (*Receipt, error) {
 		fundingCurrency = anyStr(v)
 	}
 
-	var extra map[string]any
-	if v, ok := data["extra"]; ok {
-		if m, ok := v.(map[string]any); ok {
-			extra = m
-		}
-	}
-
 	// Preserve method-defined top-level extension fields. Payment method
 	// specifications MAY define additional receipt fields (draft-ietf-httpauth-payment
 	// §5.3); the canonical mppx schema keeps them across a parse/format round trip
 	// rather than dropping them. Everything outside the known base keys is retained.
 	var extensions map[string]any
 	for k, v := range data {
-		if _, known := receiptBaseFields[k]; known {
+		if _, known := receiptBaseFields[k]; known || isEmptyReceiptExtra(k, v) {
 			continue
 		}
 		if extensions == nil {
@@ -816,7 +762,6 @@ func receiptFromFields(data map[string]any) (*Receipt, error) {
 		ExternalID:      externalID,
 		SubscriptionID:  subscriptionID,
 		FundingCurrency: fundingCurrency,
-		Extra:           extra,
 		Extensions:      extensions,
 	}, nil
 }
@@ -835,16 +780,30 @@ var receiptBaseFields = map[string]struct{}{
 	"method":         {},
 	"externalId":     {},
 	"subscriptionId": {},
-	"extra":          {},
 }
 
-// FormatPaymentReceipt formats a Receipt as a Payment-Receipt header value.
-// It returns the encoding of an empty object when r cannot be encoded.
-//
-// Deprecated: Use FormatReceiptWithError instead, which returns formatting
-// errors.
-func FormatPaymentReceipt(r *Receipt) string {
-	return b64EncodeAny(receiptFields(r))
+// isEmptyReceiptExtra reports whether a top-level receipt field is an empty
+// "extra" object, which receipts drop rather than keep as an extension.
+// Emptiness is decided by JSON shape, so any value that encodes as {} (such as
+// map[string]string{}, a named map type or json.RawMessage("{}")) is dropped
+// when formatting, as ParseReceipt drops it, keeping parse/format stable.
+func isEmptyReceiptExtra(key string, value any) bool {
+	if key != "extra" {
+		return false
+	}
+	if m, ok := value.(map[string]any); ok {
+		return len(m) == 0
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		// Left in place so encoding reports the error.
+		return false
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, encoded); err != nil {
+		return false
+	}
+	return compact.String() == "{}"
 }
 
 // FormatReceiptWithError formats r as a Payment-Receipt header value, the
@@ -902,14 +861,11 @@ func receiptFields(r *Receipt) map[string]any {
 	if r.FundingCurrency != "" {
 		data["fundingCurrency"] = r.FundingCurrency
 	}
-	if len(r.Extra) > 0 {
-		data["extra"] = r.Extra
-	}
 	// Re-emit method-defined extension fields at the top level, matching the
 	// canonical wire shape. Base fields always win, so reserved keys are never
 	// overwritten by an Extensions entry.
 	for k, v := range r.Extensions {
-		if _, reserved := receiptBaseFields[k]; reserved {
+		if _, reserved := receiptBaseFields[k]; reserved || isEmptyReceiptExtra(k, v) {
 			continue
 		}
 		if _, set := data[k]; set {

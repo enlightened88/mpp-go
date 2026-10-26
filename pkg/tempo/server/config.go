@@ -14,13 +14,12 @@ type Config struct {
 	// builds one from the verification fields below. It cannot be combined
 	// with Relay.
 	Intent *Intent
-	// Currency restricts issued challenges to exactly this token contract
-	// address. It cannot be combined with Currencies.
-	//
-	// Deprecated: Use Currencies with a single element.
-	Currency string
 	// Currencies lists the accepted token contract addresses in presentation
-	// order; see MethodConfig.Currencies.
+	// order. The server issues one charge Challenge per currency, and a
+	// Credential for any of them verifies. An explicit list replaces the chain
+	// defaults from tempo.DefaultCurrenciesForChain; it must contain at least
+	// one valid 0x-prefixed address, and case-insensitive duplicates are
+	// dropped.
 	Currencies []string
 	// Recipient is the default payee address for issued challenges.
 	Recipient string
@@ -43,16 +42,6 @@ type Config struct {
 	FeePayerSigner *temposigner.Signer
 	// FeePayerPrivateKey constructs FeePayerSigner when FeePayerSigner is nil.
 	FeePayerPrivateKey string
-	// FeePayerPrivateKeyEnv loads the fee-payer key from an environment variable when FeePayerPrivateKey is empty.
-	//
-	// Deprecated: Use FeePayerPrivateKey: os.Getenv("NAME") instead.
-	FeePayerPrivateKeyEnv string
-	// FeePayerPolicies allowlists the fee tokens this verifier will sponsor,
-	// each with its own limits. It cannot be combined with AllowedFeeTokens
-	// or FeePayerPolicy.
-	//
-	// Deprecated: Use AllowedFeeTokens and FeePayerPolicy instead.
-	FeePayerPolicies map[string]FeePayerPolicy
 	// AllowedFeeTokens lists the fee tokens this verifier will sponsor; see
 	// IntentConfig.AllowedFeeTokens.
 	AllowedFeeTokens []string
@@ -78,7 +67,7 @@ type Config struct {
 // Relay), an invalid currency or fee-payer configuration, or Intent combined
 // with Relay.
 //
-// Without Currency or Currencies, the method accepts
+// Without Currencies, the method accepts
 // tempo.DefaultCurrenciesForChain for the configured chain, or for the chain
 // inferred from RPCURL when ChainID is zero. With no custom RPC, it defaults
 // to mainnet.
@@ -86,12 +75,11 @@ func New(config Config) (*Method, error) {
 	if config.Intent != nil && config.Relay != nil {
 		return nil, fmt.Errorf("tempo server: Config.Intent cannot be combined with Relay; the relay verifies credentials")
 	}
-	if _, err := resolveCurrencies(config.Currency, config.Currencies, config.ChainID); err != nil {
+	if _, err := resolveCurrencies(config.Currencies, config.ChainID); err != nil {
 		return nil, err
 	}
-	methodConfig := MethodConfig{
+	methodConfig := methodConfig{
 		Intent:         config.Intent,
-		Currency:       config.Currency,
 		Currencies:     config.Currencies,
 		Recipient:      config.Recipient,
 		Decimals:       config.Decimals,
@@ -106,17 +94,15 @@ func New(config Config) (*Method, error) {
 			buildIntent = newIntent
 		}
 		intent, err := buildIntent(IntentConfig{
-			RPC:                   config.RPC,
-			RPCURL:                config.RPCURL,
-			FeePayerSigner:        config.FeePayerSigner,
-			FeePayerPrivateKey:    config.FeePayerPrivateKey,
-			FeePayerPrivateKeyEnv: config.FeePayerPrivateKeyEnv,
-			FeePayerPolicies:      config.FeePayerPolicies,
-			AllowedFeeTokens:      config.AllowedFeeTokens,
-			FeePayerPolicy:        config.FeePayerPolicy,
-			FeeToken:              config.FeeToken,
-			Store:                 config.Store,
-			ExpireReplayKeys:      config.ExpireReplayKeys,
+			RPC:                config.RPC,
+			RPCURL:             config.RPCURL,
+			FeePayerSigner:     config.FeePayerSigner,
+			FeePayerPrivateKey: config.FeePayerPrivateKey,
+			AllowedFeeTokens:   config.AllowedFeeTokens,
+			FeePayerPolicy:     config.FeePayerPolicy,
+			FeeToken:           config.FeeToken,
+			Store:              config.Store,
+			ExpireReplayKeys:   config.ExpireReplayKeys,
 		})
 		if err != nil {
 			return nil, err
@@ -141,12 +127,4 @@ func New(config Config) (*Method, error) {
 		return nil, fmt.Errorf("tempo server: a replay Store is required")
 	}
 	return newMethod(methodConfig), nil
-}
-
-// MethodFromConfig constructs a Tempo charge method from one config struct.
-// It returns an error when the configuration is invalid.
-//
-// Deprecated: Use New instead.
-func MethodFromConfig(config Config) (*Method, error) {
-	return New(config)
 }

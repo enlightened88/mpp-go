@@ -84,19 +84,6 @@ func WithHeader(header string) ChallengeOption {
 	return func(c *challengeConfig) { c.header = AdvertisedCredentialHeader(header) }
 }
 
-// NewChallenge creates a new Challenge with an HMAC-bound ID. The secretKey
-// and realm are used to compute the ID via GenerateChallengeIDWithError. It
-// panics where NewChallengeWithError returns an error.
-//
-// Deprecated: Use NewChallengeWithError instead.
-func NewChallenge(secretKey, realm, method, intent string, request map[string]any, opts ...ChallengeOption) *Challenge {
-	challenge, err := NewChallengeWithError(secretKey, realm, method, intent, request, opts...)
-	if err != nil {
-		panic(fmt.Sprintf("mpp: invalid challenge request: %v", err))
-	}
-	return challenge
-}
-
 // NewChallengeWithError creates a new Challenge with an HMAC-bound ID
 // computed from secretKey over realm and the other challenge parameters (see
 // GenerateChallengeIDWithError). It rejects invalid advertised credential
@@ -227,32 +214,6 @@ func (c *Challenge) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// FromAuthenticate parses an authentication header value into a Challenge.
-//
-// Deprecated: Use ParseChallenge instead.
-func FromAuthenticate(header string) (*Challenge, error) {
-	return ParseChallenge(header)
-}
-
-// ToAuthenticate formats this Challenge as an authentication header value
-// with the given realm, which the challenge ID does not bind unless it equals
-// c.Realm. It returns an empty string when c cannot be formatted.
-//
-// Deprecated: Use FormatChallenge instead, which writes c.Realm and returns
-// formatting errors.
-func (c *Challenge) ToAuthenticate(realm string) string {
-	header, _ := formatAuthenticate(c, realm, false)
-	return header
-}
-
-// ToAuthenticateStrict formats this Challenge as an authentication header value
-// and rejects values that cannot be safely represented in quoted auth-params.
-//
-// Deprecated: Use FormatChallenge instead, which writes c.Realm.
-func (c *Challenge) ToAuthenticateStrict(realm string) (string, error) {
-	return formatAuthenticateStrict(c, realm)
-}
-
 // VerifyID reports whether the challenge ID is the HMAC that secretKey binds
 // to the challenge's parameters, including c.Realm. It uses constant-time
 // comparison. A parsed challenge whose issuer encoded opaque non-canonically
@@ -264,16 +225,6 @@ func (c *Challenge) ToAuthenticateStrict(realm string) (string, error) {
 // realm, or a challenge issued for another realm verifies here.
 func (c *Challenge) VerifyID(secretKey string) bool {
 	return c.verify(secretKey, c.Realm)
-}
-
-// Verify checks whether the challenge ID matches the expected HMAC for the
-// given secretKey and realm. Uses constant-time comparison.
-//
-// Deprecated: Use VerifyID together with a c.Realm == realm check. VerifyID
-// binds the ID to the challenge's own Realm and does not compare it with the
-// realm you expect, so the check is still the caller's.
-func (c *Challenge) Verify(secretKey, realm string) bool {
-	return c.verify(secretKey, realm)
 }
 
 func (c *Challenge) verify(secretKey, realm string) bool {

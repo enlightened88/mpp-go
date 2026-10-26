@@ -12,19 +12,22 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tempoxyz/mpp-go/pkg/internal/mpptest"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/tempoxyz/mpp-go/pkg/mpp"
-	"github.com/tempoxyz/mpp-go/pkg/server"
-	"github.com/tempoxyz/mpp-go/pkg/tempo"
-	"github.com/tempoxyz/mpp-go/pkg/tempo/client"
 	temporpc "github.com/tempoxyz/tempo-go/pkg/client"
 	"github.com/tempoxyz/tempo-go/pkg/keychain"
 	temposigner "github.com/tempoxyz/tempo-go/pkg/signer"
 	tempotx "github.com/tempoxyz/tempo-go/pkg/transaction"
+
+	"github.com/tempoxyz/mpp-go/pkg/mpp"
+	"github.com/tempoxyz/mpp-go/pkg/server"
+	"github.com/tempoxyz/mpp-go/pkg/tempo"
+	chargeclient "github.com/tempoxyz/mpp-go/pkg/tempo/client"
 )
 
 const (
@@ -214,19 +217,19 @@ func TestIntentTransactionCredentialLifecycle(t *testing.T) {
 		"route":    "/paid",
 	}
 	requestMap["_mppx_scope"] = scope
-	challenge := mpp.NewChallenge(
+	challenge := mpptest.NewChallenge(
 		"test-secret-key-minimum-32-byte-secret",
 		testRealm,
 		tempo.MethodName,
 		tempo.IntentCharge,
 		requestMap,
-		mpp.WithExpires(mpp.Expires.Minutes(5)),
+		mpp.WithExpires(mpp.ExpiresIn(5*time.Minute)),
 	)
 	credential, err := newClientMethod(t, rpc, tempo.CredentialTypeTransaction).CreateCredential(ctx, challenge)
 	require.NoError(t, err)
 	rpc.callRequests = nil
 	store := newRecordingStore()
-	method, err := MethodFromConfig(Config{RPC: rpc, Store: store})
+	method, err := New(Config{RPC: rpc, Store: store})
 	require.NoError(t, err)
 	payment, err := server.New(method, testRealm, "test-secret-key-minimum-32-byte-secret")
 	require.NoError(t, err)
@@ -702,12 +705,12 @@ func TestChargeHTTPFlow_KeychainFeePayerSigningForm(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewIntent() error = %v", err)
 			}
-			method := NewMethod(MethodConfig{
-				Intent:    intent,
-				Currency:  testCurrency,
-				Recipient: testRecipient,
-				ChainID:   42431,
-				FeePayer:  true,
+			method := newMethod(methodConfig{
+				Intent:     intent,
+				Currencies: []string{testCurrency},
+				Recipient:  testRecipient,
+				ChainID:    42431,
+				FeePayer:   true,
 			})
 			payment, err := server.New(method, testRealm, "test-secret-key-at-least-32-bytes")
 			if err != nil {
@@ -742,7 +745,7 @@ func TestChargeHTTPFlow_KeychainFeePayerSigningForm(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewRequestWithContext() error = %v", err)
 			}
-			paidRequest.Header.Set("Authorization", credential.ToAuthorization())
+			paidRequest.Header.Set("Authorization", mpptest.FormatCredential(credential))
 			paidResponse, err := httpServer.Client().Do(paidRequest)
 			if err != nil {
 				t.Fatalf("paid GET error = %v", err)
@@ -1267,11 +1270,11 @@ func TestChargeFlow_HashCredentialRejectsReplayWithAlternateSpelling(t *testing.
 
 func TestChargeFlow_HashCredentialAcceptsAttributionMemo(t *testing.T) {
 	ctx := context.Background()
-	method := NewMethod(MethodConfig{Intent: testStoredIntent(),
-		Currency:  testCurrency,
-		Recipient: testRecipient,
-		Decimals:  6,
-		ChainID:   42431,
+	method := newMethod(methodConfig{Intent: testStoredIntent(),
+		Currencies: []string{testCurrency},
+		Recipient:  testRecipient,
+		Decimals:   6,
+		ChainID:    42431,
 	})
 	requestMap, err := method.BuildChargeRequest(server.ChargeParams{
 		Amount:         "0.50",
@@ -1850,7 +1853,7 @@ func TestChargeFlow_FeePayerHonorsLegacyReservation(t *testing.T) {
 	credential, err := newClientMethod(t, rpc, tempo.CredentialTypeTransaction).CreateCredential(ctx, challenge)
 	require.NoError(t, err)
 	store := tempo.NewMemoryStore()
-	require.NoError(t, store.Put(ctx, tempo.ChargeSponsoredChallengeStoreKey(challenge.ID), challenge.ID))
+	require.NoError(t, store.Put(ctx, legacySponsoredChallengeStoreKey(challenge.ID), challenge.ID))
 	intent, err := NewIntent(IntentConfig{RPC: rpc, Store: store, FeePayerPrivateKey: feePayerKey})
 	require.NoError(t, err)
 	_, err = intent.Verify(ctx, credential, request.Map())
@@ -2043,12 +2046,11 @@ func TestChargeFlow_CustomFeePayerPolicyAllowsConfiguredToken(t *testing.T) {
 	intent, err := NewIntent(IntentConfig{Store: tempo.NewMemoryStore(),
 		RPC:                rpc,
 		FeePayerPrivateKey: feePayerKey,
-		FeePayerPolicies: map[string]FeePayerPolicy{
-			request.Currency: {
-				MaxFeePerGas:         big.NewInt(10),
-				MaxPriorityFeePerGas: big.NewInt(10),
-				MaxTotalFee:          big.NewInt(1_000_000),
-			},
+		AllowedFeeTokens:   []string{request.Currency},
+		FeePayerPolicy: &FeePayerPolicy{
+			MaxFeePerGas:         big.NewInt(10),
+			MaxPriorityFeePerGas: big.NewInt(10),
+			MaxTotalFee:          big.NewInt(1_000_000),
 		},
 	})
 	if !assert.NoErrorf(t, err,
@@ -2306,10 +2308,7 @@ func TestChargeFlow_FeePayerRetryFindsReceiptForEarlierFeeToken(t *testing.T) {
 		Store:              tempo.NewMemoryStore(),
 		RPC:                rpc,
 		FeePayerPrivateKey: feePayerKey,
-		FeePayerPolicies: map[string]FeePayerPolicy{
-			pathUSDAddress: defaultFeePayerPolicy(),
-			usdceAddress:   defaultFeePayerPolicy(),
-		},
+		AllowedFeeTokens:   []string{pathUSDAddress, usdceAddress},
 	})
 	require.NoError(t, err)
 
@@ -2586,13 +2585,13 @@ func buildRequest(t *testing.T, feePayer bool, modes []tempo.ChargeMode) tempo.C
 
 func buildChallenge(t *testing.T, request tempo.ChargeRequest) *mpp.Challenge {
 	t.Helper()
-	return mpp.NewChallenge(
+	return mpptest.NewChallenge(
 		"secret-key",
 		testRealm,
 		tempo.MethodName,
 		tempo.IntentCharge,
 		request.Map(),
-		mpp.WithExpires(mpp.Expires.Minutes(5)),
+		mpp.WithExpires(mpp.ExpiresIn(5*time.Minute)),
 	)
 }
 

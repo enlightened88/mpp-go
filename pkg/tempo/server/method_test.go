@@ -20,13 +20,13 @@ func TestMethodBuildChargeRequest(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		config     MethodConfig
+		config     methodConfig
 		params     mppserver.ChargeParams
 		assertions func(*testing.T, tempo.ChargeRequest)
 	}{
 		{
 			name: "infers chain and currency from intent rpc url",
-			config: MethodConfig{
+			config: methodConfig{
 				Intent:    moderatoIntent,
 				Recipient: "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
 			},
@@ -49,7 +49,7 @@ func TestMethodBuildChargeRequest(t *testing.T) {
 		},
 		{
 			name: "rejects unknown chain without intent rpc",
-			config: MethodConfig{Intent: testStoredIntent(),
+			config: methodConfig{Intent: testStoredIntent(),
 				ChainID:   999999,
 				Recipient: "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
 			},
@@ -59,8 +59,8 @@ func TestMethodBuildChargeRequest(t *testing.T) {
 		},
 		{
 			name: "includes external id and fee payer url",
-			config: MethodConfig{Intent: testStoredIntent(),
-				Currency:    "0x20c0000000000000000000000000000000000001",
+			config: methodConfig{Intent: testStoredIntent(),
+				Currencies:  []string{"0x20c0000000000000000000000000000000000001"},
 				Recipient:   "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
 				ChainID:     42431,
 				FeePayer:    true,
@@ -90,8 +90,8 @@ func TestMethodBuildChargeRequest(t *testing.T) {
 		},
 		{
 			name: "includes splits and request modes",
-			config: MethodConfig{Intent: testStoredIntent(),
-				Currency:       "0x20c0000000000000000000000000000000000001",
+			config: methodConfig{Intent: testStoredIntent(),
+				Currencies:     []string{"0x20c0000000000000000000000000000000000001"},
 				Recipient:      "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
 				ChainID:        42431,
 				SupportedModes: []tempo.ChargeMode{tempo.ChargeModePull},
@@ -126,10 +126,10 @@ func TestMethodBuildChargeRequest(t *testing.T) {
 		},
 		{
 			name: "preserves push mode",
-			config: MethodConfig{Intent: testStoredIntent(),
-				Currency:  "0x20c0000000000000000000000000000000000001",
-				Recipient: "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
-				ChainID:   42431,
+			config: methodConfig{Intent: testStoredIntent(),
+				Currencies: []string{"0x20c0000000000000000000000000000000000001"},
+				Recipient:  "0x70997970c51812dc3a010c7d01b50e0d17dc79c8",
+				ChainID:    42431,
 			},
 			params: mppserver.ChargeParams{
 				Amount:         "0.50",
@@ -154,7 +154,7 @@ func TestMethodBuildChargeRequest(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			method := NewMethod(tt.config)
+			method := newMethod(tt.config)
 			requestMap, err := method.BuildChargeRequest(tt.params)
 			if tt.name == "rejects unknown chain without intent rpc" {
 				if !assert.Falsef(t, err == nil || err.Error() != "tempo server: unknown chain id 999999; configure Intent.RPC or Intent.RPCURL explicitly",
