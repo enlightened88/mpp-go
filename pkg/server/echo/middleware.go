@@ -37,7 +37,7 @@ func ChargeMiddleware(m *server.Mpp, params server.ChargeParams) echofw.Middlewa
 			}
 			body, err := server.ReadRequestBody(c.Request())
 			if err != nil {
-				server.WritePaymentError(c.Response(), server.RequestBodyError(err))
+				server.WritePaymentResponse(c.Response(), server.RequestBodyError(err))
 				return nil
 			}
 			if len(body) > 0 {
@@ -47,18 +47,20 @@ func ChargeMiddleware(m *server.Mpp, params server.ChargeParams) echofw.Middlewa
 			result, err := m.Charge(c.Request().Context(), chargeParams)
 			if err != nil {
 				if result != nil && result.Challenge != nil {
-					server.WritePaymentErrorWithChallenges(c.Response(), err, result.Challenges, m.Realm())
+					server.WritePaymentResponse(c.Response(), err, result.Challenges...)
 					return nil
 				}
-				server.WritePaymentError(c.Response(), err)
+				server.WritePaymentResponse(c.Response(), err)
 				return nil
 			}
 
 			if result.Challenge != nil {
-				server.WriteChallenges(c.Response(), result.Challenges, m.Realm())
+				server.WritePaymentResponse(c.Response(), nil, result.Challenges...)
 				return nil
 			}
 
+			// The payment has settled: DeferPaymentReceipt leaves out a
+			// receipt that cannot be formatted rather than failing the request.
 			ctx := server.ContextWithPayment(c.Request().Context(), result.Credential, result.Receipt)
 			c.SetRequest(c.Request().WithContext(ctx))
 			c.Set(credentialKey, result.Credential)
