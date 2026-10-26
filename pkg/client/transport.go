@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/big"
 	"mime"
 	"net/http"
 	"net/url"
@@ -16,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tempoxyz/mpp-go/pkg/internal/tempoproof"
 	"github.com/tempoxyz/mpp-go/pkg/mpp"
 )
 
@@ -29,6 +29,12 @@ type Transport struct {
 	configErr          error
 	trustedProofRealms map[string]string
 	onChallenge        OnChallengeFunc
+	maxRetries         int
+	orderChallenges    OrderChallenges
+	// payRedirects lets a Transport driven without a Client pay a redirected
+	// request when it stays on the origin of the original request. Only
+	// NewHTTPClient sets it, since its CheckRedirect refuses other origins.
+	payRedirects bool
 }
 
 const defaultMaxPaymentRetries = 3
@@ -53,12 +59,16 @@ type paymentState struct {
 }
 
 // TransportOption configures a Transport.
+//
+// Deprecated: Use NewHTTPTransport, which takes the Client's Option.
 type TransportOption func(*transportConfig)
 
 type transportConfig struct {
 	paymentPreferences PaymentPreferences
 	trustedProofRealms map[string]string
 	onChallenge        OnChallengeFunc
+	maxRetries         *int
+	orderChallenges    OrderChallenges
 }
 
 // OnChallengeFunc is called when the transport has selected a 402 challenge it
@@ -72,7 +82,9 @@ type transportConfig struct {
 //     to use the one createCredential already made,
 //   - return a credential, from createCredential or built another way, to send it,
 //   - return an error to decline the payment: RoundTrip returns that error,
-//     wrapped, and does not pay.
+//     wrapped, and does not pay. It matches ErrPaymentDeclined only when no
+//     credential was created: after createCredential succeeded the payment
+//     may already have been made, so the error is not reported as a decline.
 //
 // It runs once per challenge: a credential the transport already created for
 // the same challenge is reused without calling it again.
@@ -84,6 +96,8 @@ type OnChallengeFunc func(
 
 // WithTransportOnChallenge sets a hook that runs before the transport creates a
 // credential for a 402 challenge. Client users should use WithOnChallenge.
+//
+// Deprecated: Use NewHTTPTransport with WithOnChallenge instead.
 func WithTransportOnChallenge(onChallenge OnChallengeFunc) TransportOption {
 	return func(config *transportConfig) {
 		config.onChallenge = onChallenge
@@ -92,6 +106,9 @@ func WithTransportOnChallenge(onChallenge OnChallengeFunc) TransportOption {
 
 // WithTransportTrustedProofRealm pins the Tempo proof realm for a known HTTP origin.
 // The origin must include scheme and host (and port, when non-default).
+//
+// Deprecated: Use the Tempo charge client's Config.TrustedProofRealms
+// (package github.com/tempoxyz/mpp-go/pkg/tempo/client) instead.
 func WithTransportTrustedProofRealm(origin, realm string) TransportOption {
 	return func(config *transportConfig) {
 		if config.trustedProofRealms == nil {
@@ -104,20 +121,31 @@ func WithTransportTrustedProofRealm(origin, realm string) TransportOption {
 // WithTransportPaymentPreferences sets payment preferences on a standalone
 // Transport. Client users should use WithPaymentPreferences instead. Unknown
 // keys and invalid q-values cause RoundTrip to fail before sending the request.
+//
+// Deprecated: Use NewHTTPTransport with WithPaymentPreferences instead.
 func WithTransportPaymentPreferences(preferences PaymentPreferences) TransportOption {
 	return func(config *transportConfig) {
 		config.paymentPreferences = clonePaymentPreferences(preferences)
 	}
 }
 
-// NewTransport creates a payment-aware transport.
+// NewTransport creates a payment-aware transport. Configuration errors are
+// returned by every RoundTrip.
+//
+// Deprecated: Use NewHTTPTransport instead, which returns configuration
+// errors and takes the Client's Option, or NewHTTPClient for redirect-safe
+// payments.
 func NewTransport(methods []Method, inner http.RoundTripper, opts ...TransportOption) *Transport {
-	if inner == nil {
-		inner = http.DefaultTransport
-	}
 	config := new(transportConfig)
 	for _, opt := range opts {
 		opt(config)
+	}
+	return newTransport(methods, inner, config)
+}
+
+func newTransport(methods []Method, inner http.RoundTripper, config *transportConfig) *Transport {
+	if inner == nil {
+		inner = http.DefaultTransport
 	}
 	m := make(map[methodKey][]Method, len(methods))
 	for _, method := range methods {
@@ -125,6 +153,13 @@ func NewTransport(methods []Method, inner http.RoundTripper, opts ...TransportOp
 		m[key] = append(m[key], method)
 	}
 	preferences, header, err := resolvePaymentPreferences(methods, config.paymentPreferences)
+	maxRetries := defaultMaxPaymentRetries
+	if config.maxRetries != nil {
+		maxRetries = *config.maxRetries
+		if maxRetries < 0 && err == nil {
+			err = fmt.Errorf("mpp: max payment retries must not be negative, got %d", maxRetries)
+		}
+	}
 	return &Transport{
 		methods:            m,
 		inner:              inner,
@@ -133,6 +168,8 @@ func NewTransport(methods []Method, inner http.RoundTripper, opts ...TransportOp
 		configErr:          err,
 		trustedProofRealms: config.trustedProofRealms,
 		onChallenge:        config.onChallenge,
+		maxRetries:         maxRetries,
+		orderChallenges:    config.orderChallenges,
 	}
 }
 
@@ -171,7 +208,7 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 			return nil, err
 		}
-		if resp.StatusCode != http.StatusPaymentRequired || retries >= defaultMaxPaymentRetries {
+		if resp.StatusCode != http.StatusPaymentRequired || retries >= t.maxRetries {
 			return resp, nil
 		}
 
@@ -185,13 +222,20 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		challenges, errs := t.parseChallenges(resp.Header)
 		_ = errs // Non-Payment or malformed headers are silently skipped.
 		candidates := t.challengeCandidates(challenges, preferences, time.Now().UTC())
+		if len(candidates) > 0 && t.orderChallenges != nil {
+			candidates, err = t.orderCandidates(baseRequest.Context(), candidates)
+			if err != nil {
+				drainAndClose(resp.Body)
+				return nil, err
+			}
+		}
 		if len(candidates) == 0 {
 			return resp, nil
 		}
 		var selected challengeCandidate
 		var rejected error
 		for _, candidate := range candidates {
-			if err := t.validatePaymentOrigin(request, candidate.challenge); err != nil {
+			if err := t.validatePaymentOrigin(request, candidate); err != nil {
 				rejected = err
 				continue
 			}
@@ -385,12 +429,50 @@ func (t *Transport) createCredential(ctx context.Context, selected challengeCand
 		if created && createdErr != nil && errors.Is(err, createdErr) {
 			return nil, err
 		}
-		return nil, fmt.Errorf("mpp: onChallenge: %w", err)
+		// A hook that failed after createCredential made a credential did not
+		// decline: the method may already have paid.
+		if created && createdErr == nil {
+			return nil, fmt.Errorf("mpp: onChallenge after creating credential: %w", err)
+		}
+		return nil, &declinedError{err: err}
 	}
 	if cred == nil {
 		return create(ctx)
 	}
 	return cred, nil
+}
+
+// declinedError is an error an OnChallengeFunc returned to decline a
+// payment. It matches both ErrPaymentDeclined and the hook's error.
+type declinedError struct {
+	err error
+}
+
+func (e *declinedError) Error() string { return "mpp: onChallenge: " + e.err.Error() }
+
+func (e *declinedError) Unwrap() []error { return []error{ErrPaymentDeclined, e.err} }
+
+// orderCandidates runs the OrderChallenges hook on the ranked candidates and
+// returns its order. Entries without a Challenge or a Method for its method
+// and intent are dropped.
+func (t *Transport) orderCandidates(ctx context.Context, ranked []challengeCandidate) ([]challengeCandidate, error) {
+	exported := make([]ChallengeCandidate, len(ranked))
+	for i, candidate := range ranked {
+		exported[i] = ChallengeCandidate{Challenge: candidate.challenge, Method: candidate.method, Quality: candidate.quality}
+	}
+	ordered, err := t.orderChallenges(ctx, exported)
+	if err != nil {
+		return nil, fmt.Errorf("mpp: orderChallenges: %w", err)
+	}
+	result := make([]challengeCandidate, 0, len(ordered))
+	for _, candidate := range ordered {
+		if candidate.Challenge == nil || candidate.Method == nil ||
+			candidate.Method.Name() != candidate.Challenge.Method || candidate.Method.Intent() != candidate.Challenge.Intent {
+			continue
+		}
+		result = append(result, challengeCandidate{challenge: candidate.Challenge, method: candidate.Method, quality: candidate.Quality})
+	}
+	return result, nil
 }
 
 // responseProblemType returns the problem type of a 402 response body, or ""
@@ -565,19 +647,34 @@ func paymentOrigin(ctx context.Context) string {
 	return ""
 }
 
+// requestOrigin returns the origin of requestURL with its scheme and host
+// lowercased and a default port (443 for https, 80 for http) dropped, so
+// https://h and https://h:443 compare equal.
 func requestOrigin(requestURL *url.URL) string {
-	if requestURL == nil {
-		return ""
-	}
-	return strings.ToLower(requestURL.Scheme) + "://" + strings.ToLower(requestURL.Host)
+	return tempoproof.Origin(requestURL)
 }
 
 func sameOriginURL(requestURL *url.URL, origin string) bool {
 	return requestOrigin(requestURL) == origin
 }
 
-func (t *Transport) validatePaymentOrigin(req *http.Request, challenge *mpp.Challenge) error {
+func (t *Transport) validatePaymentOrigin(req *http.Request, candidate challengeCandidate) error {
+	challenge := candidate.challenge
 	origin := paymentOrigin(req.Context())
+	if origin == "" && t.payRedirects {
+		// NewHTTPClient's CheckRedirect keeps redirects on the origin of the
+		// request the caller sent, the first in the redirect chain.
+		first := req
+		for first.Response != nil {
+			if first.Response.Request == nil {
+				// A broken chain hides the request the caller sent: fail
+				// closed rather than trust this redirected request's origin.
+				return fmt.Errorf("mpp: refusing payment after redirect to %q; the redirect chain does not lead back to the original request", requestOrigin(req.URL))
+			}
+			first = first.Response.Request
+		}
+		origin = requestOrigin(first.URL)
+	}
 	if origin == "" {
 		// Standalone Transport: no trusted origin was pinned into the context
 		// (that only happens when the Transport is driven through Client.Do).
@@ -594,28 +691,36 @@ func (t *Transport) validatePaymentOrigin(req *http.Request, challenge *mpp.Chal
 	if !sameOriginURL(req.URL, origin) {
 		return fmt.Errorf("mpp: refusing payment for redirected origin %q", requestOrigin(req.URL))
 	}
-	// A zero-amount Tempo proof can authenticate the payer at the realm named
-	// in the challenge. The HTTP server that sent it must own that realm.
-	if challenge.Method == "tempo" && challenge.Intent == mpp.IntentCharge &&
-		isZeroTempoAmount(challenge.Request["amount"]) &&
-		!(req.URL.Scheme == "https" && (req.URL.Port() == "" || req.URL.Port() == "443") &&
-			strings.EqualFold(challenge.Realm, req.URL.Hostname())) &&
-		challenge.Realm != t.trustedProofRealms[requestOrigin(req.URL)] {
-		return fmt.Errorf("mpp: refusing to sign Tempo proof for realm %q from %q", challenge.Realm, requestOrigin(req.URL))
+	// The method decides whether the server at this origin may receive its
+	// credential, such as a Tempo proof that authenticates the payer at the
+	// challenge realm. A realm pinned with the deprecated
+	// WithTrustedTempoProofRealm still passes, but only for a zero-amount
+	// tempo/charge proof: the method's other origin rules stay authoritative.
+	if validator, ok := candidate.method.(OriginValidator); ok {
+		err := validator.ValidateOrigin(req.URL, challenge)
+		if err != nil && (!tempoproof.IsProofChallenge(challenge) || !t.pinnedProofRealm(req.URL, challenge.Realm)) {
+			return err
+		}
+		return nil
+	}
+	// Methods that do not validate origins keep the built-in rule for
+	// zero-amount tempo/charge proofs: the server must own the realm.
+	if tempoproof.IsProofChallenge(challenge) &&
+		!tempoproof.OriginOwnsRealm(req.URL, challenge.Realm) &&
+		!t.pinnedProofRealm(req.URL, challenge.Realm) {
+		return tempoproof.RealmError(challenge.Realm, requestOrigin(req.URL), "")
 	}
 	return nil
 }
 
-func isZeroTempoAmount(value any) bool {
-	amount := strings.TrimSpace(fmt.Sprint(value))
-	if amount == "" {
-		return false
-	}
-	for _, digit := range amount {
-		if digit < '0' || digit > '9' {
-			return false
+// pinnedProofRealm reports whether WithTrustedTempoProofRealm pinned realm
+// for the origin of u.
+func (t *Transport) pinnedProofRealm(u *url.URL, realm string) bool {
+	origin := requestOrigin(u)
+	for pinnedOrigin, pinned := range t.trustedProofRealms {
+		if tempoproof.NormalizeOrigin(pinnedOrigin) == origin && pinned == realm {
+			return true
 		}
 	}
-	parsed, ok := new(big.Int).SetString(amount, 10)
-	return ok && parsed.Sign() == 0
+	return false
 }
