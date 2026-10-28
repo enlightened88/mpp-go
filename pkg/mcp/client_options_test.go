@@ -2,16 +2,27 @@ package mcp_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/tempoxyz/mpp-go/pkg/client"
+	"github.com/tempoxyz/mpp-go/pkg/internal/mpptest"
 	mcpclient "github.com/tempoxyz/mpp-go/pkg/mcp/client"
 	"github.com/tempoxyz/mpp-go/pkg/mpp"
+	chargeclient "github.com/tempoxyz/mpp-go/pkg/tempo/client"
 )
 
 func TestMiddlewarePaysWithoutWrap(t *testing.T) {
@@ -63,14 +74,365 @@ func TestMCPClientDefersToOriginValidator(t *testing.T) {
 	session := connect(t, zeroTempoChallengeServer(t, "victim.example"), mcpclient.Wrap(newClient(), mcpclient.Config{Methods: []client.Method{trusted}}))
 	_, err := callPremium(context.Background(), session, nil)
 	require.Error(t, err)
-	assert.Len(t, trusted.credentials(), 1, "the validator trusts the realm, so the proof is created")
-	require.NotEmpty(t, trusted.origins)
-	assert.Nil(t, trusted.origins[0], "MCP has no origin")
+	assert.Empty(t, trusted.credentials(), "origin-less realm trust alone must not authorize an MCP session")
+	assert.Empty(t, trusted.origins)
 
 	refused := &validatingProofMethod{trusted: "other.example"}
-	session = connect(t, zeroTempoChallengeServer(t, "victim.example"), mcpclient.Wrap(newClient(), mcpclient.Config{Methods: []client.Method{refused}}))
+	session = connect(t, zeroTempoChallengeServer(t, "victim.example"), mcpclient.Wrap(newClient(), mcpclient.Config{Methods: []client.Method{refused}, ValidateTempoProofSession: func(context.Context, *mcp.ClientSession, string) error { return nil }}))
 	_, err = callPremium(context.Background(), session, nil)
 	require.ErrorContains(t, err, "validator refused realm")
 	assert.Empty(t, refused.credentials())
 
+}
+
+func TestProofTrustIsScopedToSession(t *testing.T) {
+	payer := &validatingProofMethod{trusted: "victim.example"}
+	c := newClient()
+	trusted := connect(t, zeroTempoChallengeServer(t, "victim.example"), c)
+	untrusted := connect(t, zeroTempoChallengeServer(t, "victim.example"), c)
+	mcpclient.Wrap(c, mcpclient.Config{
+		Methods: []client.Method{payer},
+		ValidateTempoProofSession: func(_ context.Context, session *mcp.ClientSession, realm string) error {
+			if session != trusted || realm != "victim.example" {
+				return errors.New("untrusted proof session")
+			}
+			return nil
+		},
+	})
+	// A per-call payment approval override must not bypass session trust.
+	ctx := mcpclient.WithOnPaymentRequired(context.Background(), nil)
+	_, err := callPremium(ctx, untrusted, nil)
+	require.ErrorContains(t, err, "untrusted proof session")
+	assert.Empty(t, payer.credentials())
+	_, err = callPremium(ctx, trusted, nil)
+	require.Error(t, err) // the mock keeps offering its challenge
+	assert.Len(t, payer.credentials(), 1)
+	_, err = callPremium(ctx, untrusted, nil)
+	require.ErrorContains(t, err, "untrusted proof session")
+	assert.Len(t, payer.credentials(), 1)
+}
+
+func TestCachedProofRechecksSessionTrust(t *testing.T) {
+	payer := &validatingProofMethod{trusted: "victim.example"}
+	checks := 0
+	c := mcpclient.Wrap(newClient(), mcpclient.Config{
+		Methods: []client.Method{payer},
+		ValidateTempoProofSession: func(context.Context, *mcp.ClientSession, string) error {
+			checks++
+			if checks > 1 {
+				return errors.New("session trust revoked")
+			}
+			return nil
+		},
+	})
+	session := connect(t, zeroTempoChallengeServer(t, "victim.example"), c)
+	_, err := callPremium(context.Background(), session, nil)
+	require.ErrorContains(t, err, "session trust revoked")
+	assert.Equal(t, 2, checks)
+	assert.Len(t, payer.credentials(), 1)
+}
+
+// realProofMethod pays tempo/charge proofs and validates origins with the
+// Tempo client method's own rule.
+type realProofMethod struct {
+	tempoProofMethod
+	validator *chargeclient.Method
+}
+
+func (m *realProofMethod) ValidateOrigin(origin *url.URL, challenge *mpp.Challenge) error {
+	return m.validator.ValidateOrigin(origin, challenge)
+}
+
+func newRealProofMethod(t *testing.T, trusted ...chargeclient.TrustedProofRealm) *realProofMethod {
+	t.Helper()
+	validator, err := chargeclient.New(chargeclient.Config{
+		PrivateKey:         "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80",
+		TrustedProofRealms: trusted,
+	})
+	require.NoError(t, err)
+	return &realProofMethod{validator: validator}
+}
+
+// connectHTTPS connects c to srv over Streamable HTTP at endpoint, an
+// https://<host>/ URL the test server's certificate (issued for example.com)
+// is accepted for, whatever host it names.
+func connectHTTPS(t *testing.T, srv *mcp.Server, c *mcp.Client, endpoint string) *mcp.ClientSession {
+	t.Helper()
+	t.Helper()
+	_, transport := httpsTransport(t, srv, endpoint, func(hc *http.Client) *http.Client { return hc })
+	// mcpclient.Connect makes the plain test client redirect-safe.
+	session, err := mcpclient.Connect(context.Background(), c, transport, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = session.Close() })
+	return session
+}
+
+// connectHTTPSWith is connectHTTPS with c.Connect and the HTTP client
+// client builds.
+func connectHTTPSWith(t *testing.T, srv *mcp.Server, c *mcp.Client, endpoint string, client func(*http.Client) *http.Client) *mcp.ClientSession {
+	t.Helper()
+	_, transport := httpsTransport(t, srv, endpoint, client)
+	session, err := c.Connect(context.Background(), transport, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = session.Close() })
+	return session
+}
+
+// httpsTransport serves srv over TLS and returns a transport that reaches it
+// at endpoint, with the HTTP client client builds.
+func httpsTransport(t *testing.T, srv *mcp.Server, endpoint string, client func(*http.Client) *http.Client) (*httptest.Server, *mcp.StreamableClientTransport) {
+	t.Helper()
+	// The test server listens on localhost but is reached under other host names.
+	ts := httptest.NewTLSServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{DisableLocalhostProtection: true}))
+	t.Cleanup(ts.Close)
+	transport := ts.Client().Transport.(*http.Transport).Clone()
+	transport.TLSClientConfig.ServerName = "example.com"
+	addr := ts.Listener.Addr().String()
+	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, addr)
+	}
+	return ts, &mcp.StreamableClientTransport{
+		Endpoint:   endpoint,
+		HTTPClient: client(&http.Client{Transport: transport}),
+		MaxRetries: -1,
+	}
+}
+
+// E11: a shared client signs a realm's proof only for the session connected
+// to that realm's endpoint, without any configuration, so a server cannot
+// relay another server's challenge.
+func TestProofIsImplicitlyBoundToSessionEndpoint(t *testing.T) {
+	payer := newRealProofMethod(t)
+	c := mcpclient.Wrap(newClient(), mcpclient.Config{Methods: []client.Method{payer}})
+	// A per-call payment approval override must not bypass session binding.
+	ctx := mcpclient.WithOnPaymentRequired(context.Background(), nil)
+
+	relay := connectHTTPS(t, zeroTempoChallengeServer(t, "example.com"), c, "https://attacker.test/")
+	_, err := callPremium(ctx, relay, nil)
+	require.ErrorContains(t, err, "refusing to sign Tempo proof")
+	assert.Empty(t, payer.credentials())
+
+	local := connect(t, zeroTempoChallengeServer(t, "example.com"), c)
+	_, err = callPremium(ctx, local, nil)
+	require.ErrorContains(t, err, "Config.ValidateTempoProofSession")
+	assert.Empty(t, payer.credentials())
+
+	owner := connectHTTPS(t, zeroTempoChallengeServer(t, "example.com"), c, "https://example.com/mcp")
+	_, err = callPremium(ctx, owner, nil)
+	require.Error(t, err) // the mock keeps offering its challenge
+	assert.Len(t, payer.credentials(), 1)
+
+	_, err = callPremium(ctx, relay, nil)
+	require.ErrorContains(t, err, "refusing to sign Tempo proof")
+	assert.Len(t, payer.credentials(), 1)
+}
+
+func TestTrustedProofRealmMatchesSessionEndpointOrigin(t *testing.T) {
+	// An origin-less entry no longer trusts the realm for every session.
+	originless := newRealProofMethod(t, chargeclient.TrustedProofRealm{Realm: "MPP Payment"})
+	session := connectHTTPS(t, zeroTempoChallengeServer(t, "MPP Payment"), mcpclient.Wrap(newClient(), mcpclient.Config{Methods: []client.Method{originless}}), "https://example.com/")
+	_, err := callPremium(context.Background(), session, nil)
+	require.ErrorContains(t, err, "refusing to sign Tempo proof")
+	assert.Empty(t, originless.credentials())
+
+	trusted := newRealProofMethod(t, chargeclient.TrustedProofRealm{Origin: "https://example.com", Realm: "MPP Payment"})
+	session = connectHTTPS(t, zeroTempoChallengeServer(t, "MPP Payment"), mcpclient.Wrap(newClient(), mcpclient.Config{Methods: []client.Method{trusted}}), "https://example.com/")
+	_, err = callPremium(context.Background(), session, nil)
+	require.Error(t, err)
+	assert.Len(t, trusted.credentials(), 1)
+}
+
+func TestProofWithoutOriginValidatorUsesSessionEndpoint(t *testing.T) {
+	payer := &tempoProofMethod{}
+	c := mcpclient.Wrap(newClient(), mcpclient.Config{Methods: []client.Method{payer}})
+	session := connectHTTPS(t, zeroTempoChallengeServer(t, "example.com"), c, "https://attacker.test/")
+	_, err := callPremium(context.Background(), session, nil)
+	require.ErrorContains(t, err, "refusing to sign Tempo proof")
+	assert.Empty(t, payer.credentials())
+
+	session = connectHTTPS(t, zeroTempoChallengeServer(t, "example.com"), c, "https://example.com/")
+	_, err = callPremium(context.Background(), session, nil)
+	require.Error(t, err)
+	assert.Len(t, payer.credentials(), 1)
+}
+
+// A re-offer that keeps a cached proof's ID but changes its amount must not
+// resubmit the proof without the session check.
+func TestChangedAmountReofferDoesNotReuseCachedProof(t *testing.T) {
+	proof := mpptest.NewChallenge(secretKey, "victim.example", "tempo", "charge", map[string]any{"amount": "0", "currency": "0x20c0"}, mpp.WithExpires(mpp.ExpiresIn(5*time.Minute)))
+	paid := mpptest.NewChallenge(secretKey, "victim.example", "tempo", "charge", map[string]any{"amount": "1", "currency": "0x20c0"}, mpp.WithExpires(proof.Expires))
+	paid.ID = proof.ID
+	var mu sync.Mutex
+	var submitted []string
+	srv := newServer(func(_ context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		challenge := proof
+		if raw, ok := req.Params.Meta[mpp.MCPCredentialMetaKey]; ok {
+			encoded, err := json.Marshal(raw)
+			require.NoError(t, err)
+			var credential mpp.Credential
+			require.NoError(t, json.Unmarshal(encoded, &credential))
+			mu.Lock()
+			amount := "1"
+			if credential.Challenge.Request == proof.ToEcho().Request {
+				amount = "0"
+			}
+			submitted = append(submitted, amount)
+			mu.Unlock()
+			challenge = paid
+		}
+		data, err := json.Marshal(mpp.MCPPaymentRequiredData{HTTPStatus: 402, Challenges: []*mpp.Challenge{challenge}})
+		require.NoError(t, err)
+		return nil, &jsonrpc.Error{Code: mpp.MCPPaymentRequiredCode, Message: "Payment Required", Data: data}
+	})
+	payer := &validatingProofMethod{trusted: "victim.example"}
+	checks := 0
+	c := mcpclient.Wrap(newClient(), mcpclient.Config{
+		Methods: []client.Method{payer},
+		ValidateTempoProofSession: func(context.Context, *mcp.ClientSession, string) error {
+			checks++
+			if checks > 1 {
+				return errors.New("session trust revoked")
+			}
+			return nil
+		},
+	})
+	session := connect(t, srv, c)
+	_, err := callPremium(context.Background(), session, nil)
+	require.Error(t, err)
+	assert.Equal(t, 1, checks)
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotEmpty(t, submitted)
+	assert.Equal(t, "0", submitted[0])
+	for _, amount := range submitted[1:] {
+		assert.Equal(t, "1", amount, "the zero-amount proof was resubmitted for a changed challenge")
+	}
+}
+
+// A proof sent through a client that follows cross-origin redirects could
+// land on another server than the endpoint, so such a session gets none.
+func TestProofRefusedWhenSessionFollowsCrossOriginRedirects(t *testing.T) {
+	payer := newRealProofMethod(t)
+	c := mcpclient.Wrap(newClient(), mcpclient.Config{Methods: []client.Method{payer}})
+	following := []func(*http.Client) *http.Client{
+		func(hc *http.Client) *http.Client { return hc },
+		func(hc *http.Client) *http.Client {
+			hc.CheckRedirect = func(*http.Request, []*http.Request) error { return nil }
+			return hc
+		},
+		// A selective hook that refuses some origins but not others.
+		func(hc *http.Client) *http.Client {
+			hc.CheckRedirect = func(req *http.Request, _ []*http.Request) error {
+				if strings.HasSuffix(req.URL.Hostname(), ".invalid") {
+					return errors.New("refused")
+				}
+				return nil
+			}
+			return hc
+		},
+	}
+	for _, hc := range following {
+		session := connectHTTPSWith(t, zeroTempoChallengeServer(t, "example.com"), c, "https://example.com/mcp", hc)
+		_, err := callPremium(context.Background(), session, nil)
+		require.ErrorContains(t, err, "mcpclient.HTTPClient")
+	}
+	assert.Empty(t, payer.credentials())
+}
+
+func TestHTTPClientRefusesCrossOriginRedirects(t *testing.T) {
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusTeapot) }))
+	t.Cleanup(other.Close)
+	var same *httptest.Server
+	same = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/away":
+			http.Redirect(w, r, other.URL, http.StatusTemporaryRedirect)
+		case "/here":
+			http.Redirect(w, r, same.URL+"/done", http.StatusTemporaryRedirect)
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	t.Cleanup(same.Close)
+	hc := mcpclient.HTTPClient(nil)
+	resp, err := hc.Post(same.URL+"/away", "application/json", nil)
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	require.ErrorContains(t, err, "refusing cross-origin redirect")
+	resp, err = hc.Post(same.URL+"/here", "application/json", nil)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
+	assert.Nil(t, http.DefaultClient.CheckRedirect, "HTTPClient must not modify its base")
+}
+
+// A hook that approves a Streamable HTTP session whose client follows
+// redirects must not make an origin-less TrustedProofRealm, meant for stdio,
+// cover it: the method still sees the session's endpoint.
+func TestOriginlessTrustedRealmIgnoresRedirectFollowingSession(t *testing.T) {
+	payer := newRealProofMethod(t, chargeclient.TrustedProofRealm{Realm: "stdio.example"})
+	c := mcpclient.Wrap(newClient(), mcpclient.Config{
+		Methods:                   []client.Method{payer},
+		ValidateTempoProofSession: func(context.Context, *mcp.ClientSession, string) error { return nil },
+	})
+	plain := func(hc *http.Client) *http.Client { return hc }
+	session := connectHTTPSWith(t, zeroTempoChallengeServer(t, "stdio.example"), c, "https://attacker.test/", plain)
+	_, err := callPremium(context.Background(), session, nil)
+	require.ErrorContains(t, err, "refusing to sign Tempo proof")
+	assert.Empty(t, payer.credentials())
+
+	// Nor does the hook let a redirect-following session sign for the realm
+	// its endpoint owns: a redirect could deliver the proof elsewhere.
+	owner := connectHTTPSWith(t, zeroTempoChallengeServer(t, "example.com"), c, "https://example.com/mcp", plain)
+	_, err = callPremium(context.Background(), owner, nil)
+	require.ErrorContains(t, err, "mcpclient.HTTPClient")
+	assert.Empty(t, payer.credentials())
+
+	// The same realm over stdio-like transports is still trusted.
+	local := connect(t, zeroTempoChallengeServer(t, "stdio.example"), c)
+	_, err = callPremium(context.Background(), local, nil)
+	require.Error(t, err)
+	assert.Len(t, payer.credentials(), 1)
+}
+
+func TestConnectKeepsTransportAndAddsRedirectGuard(t *testing.T) {
+	srv := mcp.NewServer(&mcp.Implementation{Name: "s", Version: "1.0.0"}, nil)
+	_, transport := httpsTransport(t, srv, "https://example.com/mcp", func(hc *http.Client) *http.Client { return hc })
+	base := transport.HTTPClient
+	session, err := mcpclient.Connect(context.Background(), newClient(), transport, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = session.Close() })
+	assert.Same(t, base, transport.HTTPClient, "Connect must not modify the transport")
+	assert.Nil(t, base.CheckRedirect)
+
+	_, err = mcpclient.Connect(context.Background(), newClient(), nil, nil)
+	require.Error(t, err)
+}
+
+// A method that validates origins sees no origin for a session whose client
+// follows cross-origin redirects, whatever the challenge, and the endpoint
+// for one connected with mcpclient.Connect.
+func TestOriginValidatorSeesEndpointOnlyWhenRedirectSafe(t *testing.T) {
+	challenge := mpptest.NewChallenge(secretKey, "example.com", "tempo", "charge", map[string]any{"amount": "1", "currency": "0x20c0"}, mpp.WithExpires(mpp.ExpiresIn(5*time.Minute)))
+	data, err := json.Marshal(mpp.MCPPaymentRequiredData{HTTPStatus: 402, Challenges: []*mpp.Challenge{challenge}})
+	require.NoError(t, err)
+	paid := func() *mcp.Server {
+		return newServer(func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return nil, &jsonrpc.Error{Code: mpp.MCPPaymentRequiredCode, Message: "Payment Required", Data: data}
+		})
+	}
+	payer := &validatingProofMethod{trusted: "example.com"}
+	c := mcpclient.Wrap(newClient(), mcpclient.Config{Methods: []client.Method{payer}})
+
+	plain := func(hc *http.Client) *http.Client { return hc }
+	_, _ = callPremium(context.Background(), connectHTTPSWith(t, paid(), c, "https://example.com/mcp", plain), nil)
+	require.NotEmpty(t, payer.origins)
+	assert.Nil(t, payer.origins[0])
+
+	payer.origins = nil
+	_, _ = callPremium(context.Background(), connectHTTPS(t, paid(), c, "https://example.com/mcp"), nil)
+	require.NotEmpty(t, payer.origins)
+	require.NotNil(t, payer.origins[0])
+	assert.Equal(t, "https://example.com/mcp", payer.origins[0].String())
 }

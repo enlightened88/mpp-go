@@ -6,10 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net/http"
+	"net/url"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 	"weak"
 
 	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
@@ -52,6 +56,21 @@ type Config struct {
 	OnPaymentRequired OnPaymentRequired
 	// OrderChallenges, when set, filters and sorts payable Challenges.
 	OrderChallenges OrderChallenges
+	// ValidateTempoProofSession, when set, also authorizes the session for a
+	// zero-amount Tempo proof's realm before a proof is signed or reused;
+	// return an error to refuse. Most clients leave it nil: a proof is then
+	// bound to the session's transport, so only a session the client connected
+	// with Connect (a StreamableClientTransport with HTTPClient's redirect guard), to
+	// an endpoint whose origin the method trusts for the realm (by default an
+	// HTTPS endpoint on the default port whose hostname is the realm), gets
+	// one, whichever session relays the challenge. Set it for sessions without
+	// an endpoint (stdio, in-memory or wrapped transports), which are otherwise
+	// refused proofs. It cannot authorize a Streamable HTTP session whose
+	// client follows cross-origin redirects, which is always refused; compare the
+	// session pointer with sessions you connected yourself, never with a name
+	// or realm the peer sent. WithOnPaymentRequired does not bypass it, and the
+	// method's OriginValidator still runs with the session's origin.
+	ValidateTempoProofSession func(context.Context, *mcp.ClientSession, string) error
 	// PaymentPreferences ranks Challenges by "method/intent" q-values.
 	PaymentPreferences mppclient.PaymentPreferences
 }
@@ -137,7 +156,7 @@ func (w *wrapper) middleware(next mcp.MethodHandler) mcp.MethodHandler {
 			if cause == nil {
 				cause = errors.New("mpp: tool result requires payment")
 			}
-			paid, key, payErr := config.pay(ctx, params, data, credentials, cause)
+			paid, key, payErr := config.pay(ctx, session, params, data, credentials, cause)
 			if payErr != nil {
 				return nil, payErr
 			}
@@ -147,8 +166,21 @@ func (w *wrapper) middleware(next mcp.MethodHandler) mcp.MethodHandler {
 	}
 }
 
+// credentialKey identifies a Credential by the whole Challenge it pays, so a
+// re-offer that keeps the ID but changes the request (such as a proof
+// challenge re-offered with a nonzero amount) never reuses it.
 type credentialKey struct {
 	id, method, intent string
+	challenge          string
+}
+
+func newCredentialKey(challenge *mpp.Challenge) (credentialKey, error) {
+	// The echo is what a Credential for challenge carries.
+	encoded, err := json.Marshal(challenge.ToEcho())
+	if err != nil {
+		return credentialKey{}, fmt.Errorf("mpp: encoding challenge: %w", err)
+	}
+	return credentialKey{id: challenge.ID, method: challenge.Method, intent: challenge.Intent, challenge: string(encoded)}, nil
 }
 
 // pay selects a Challenge, approves and pays it (or reuses the Credential
@@ -156,6 +188,7 @@ type credentialKey struct {
 // with the Credential in their metadata.
 func (config *Config) pay(
 	ctx context.Context,
+	session *mcp.ClientSession,
 	original *mcp.CallToolParams,
 	data *mpp.MCPPaymentRequiredData,
 	credentials map[credentialKey]*mpp.Credential,
@@ -196,7 +229,7 @@ func (config *Config) pay(
 	var rejected error
 	payable := candidates[:0:0]
 	for _, candidate := range candidates {
-		if err := config.checkOrigin(candidate); err != nil {
+		if err := config.checkOrigin(ctx, session, candidate); err != nil {
 			rejected = err
 			continue
 		}
@@ -206,7 +239,10 @@ func (config *Config) pay(
 		return nil, credentialKey{}, fmt.Errorf("%w: %w", rejected, cause)
 	}
 	selected := payable[0]
-	key := credentialKey{id: selected.Challenge.ID, method: selected.Challenge.Method, intent: selected.Challenge.Intent}
+	key, err := newCredentialKey(selected.Challenge)
+	if err != nil {
+		return nil, credentialKey{}, err
+	}
 	if credential, ok := credentials[key]; ok {
 		return withCredential(original, credential), key, nil
 	}
@@ -253,19 +289,51 @@ func withCredential(original *mcp.CallToolParams, credential *mpp.Credential) *m
 }
 
 // checkOrigin asks the candidate's method, when it implements
-// client.OriginValidator, whether it may pay a Challenge from a server without
-// an origin. Other methods keep the built-in rule: a zero-amount tempo/charge
-// Challenge is refused, since an MCP server has no origin that could own its
-// realm.
-func (config *Config) checkOrigin(candidate mppclient.ChallengeCandidate) error {
+// client.OriginValidator, whether it may pay a Challenge from the server at
+// the session's transport origin (see sessionOrigin), nil when the session
+// has none. Other methods keep the built-in rule: a zero-amount tempo/charge
+// Challenge is paid only when that origin owns its realm.
+//
+// A proof authenticates the payer at the realm, so it is bound to the session
+// that received the challenge: a session without a transport origin gets one
+// only when Config.ValidateTempoProofSession authorizes it, so a server cannot
+// relay another server's challenge through a shared client.
+func (config *Config) checkOrigin(ctx context.Context, session *mcp.ClientSession, candidate mppclient.ChallengeCandidate) error {
 	challenge := candidate.Challenge
-	if validator, ok := candidate.Method.(mppclient.OriginValidator); ok {
-		return validator.ValidateOrigin(nil, challenge)
+	// origin is the session's endpoint even when its HTTP client follows
+	// cross-origin redirects, so such a session is told apart from stdio and
+	// refused proofs even when the hook approves it.
+	origin, redirectSafe := sessionEndpoint(session)
+	if tempoproof.IsProofChallenge(challenge) {
+		switch {
+		case origin != nil && !redirectSafe:
+			// A redirect could carry the proof to another server, whatever the
+			// hook says, so the hook only vouches for origin-less sessions.
+			return tempoproof.RealmError(challenge.Realm, "", "connect with mcpclient.Connect, or set the transport's HTTPClient to mcpclient.HTTPClient(nil)")
+		case config.ValidateTempoProofSession != nil:
+			if session == nil {
+				return tempoproof.RealmError(challenge.Realm, "", "the request has no MCP session")
+			}
+			if err := config.ValidateTempoProofSession(ctx, session, challenge.Realm); err != nil {
+				return err
+			}
+		case origin == nil:
+			return tempoproof.RealmError(challenge.Realm, "", "connect with mcpclient.Connect (or set the transport's HTTPClient to mcpclient.HTTPClient(nil)), or authorize the session with Config.ValidateTempoProofSession")
+		}
 	}
-	if !tempoproof.IsProofChallenge(challenge) {
+	if !redirectSafe {
+		// A redirect could carry any Credential to another server, so a
+		// method sees no origin (as on stdio) rather than the endpoint's. A
+		// proof from such an endpoint was refused above.
+		origin = nil
+	}
+	if validator, ok := candidate.Method.(mppclient.OriginValidator); ok {
+		return validator.ValidateOrigin(origin, challenge)
+	}
+	if !tempoproof.IsProofChallenge(challenge) || tempoproof.OriginOwnsRealm(origin, challenge.Realm) {
 		return nil
 	}
-	return tempoproof.RealmError(challenge.Realm, "", "trust it with the Tempo method's Config.TrustedProofRealms")
+	return tempoproof.RealmError(challenge.Realm, tempoproof.Origin(origin), "trust it with the Tempo method's Config.TrustedProofRealms")
 }
 
 // IsPaymentRequiredError reports whether err is an MCP payment-required or
@@ -352,4 +420,127 @@ func Receipt(result *mcp.CallToolResult) (*mpp.MCPReceipt, error) {
 		return nil, err
 	}
 	return &receipt, nil
+}
+
+// mcpPackage is the import path of the MCP Go SDK's mcp package.
+var mcpPackage = reflect.TypeFor[mcp.ClientSession]().PkgPath()
+
+// Connect connects c to the Streamable HTTP endpoint of transport, like
+// c.Connect, with the transport's HTTPClient (http.DefaultClient when nil)
+// wrapped by HTTPClient so it refuses cross-origin redirects. Sessions
+// connected this way get zero-amount Tempo proofs for realms their endpoint's
+// origin is trusted for, with no other configuration. transport is copied,
+// not modified.
+func Connect(ctx context.Context, c *mcp.Client, transport *mcp.StreamableClientTransport, opts *mcp.ClientSessionOptions) (*mcp.ClientSession, error) {
+	if transport == nil {
+		return nil, errors.New("mpp: Connect needs a StreamableClientTransport")
+	}
+	safe := *transport
+	if !refusesCrossOriginRedirects(safe.HTTPClient) {
+		safe.HTTPClient = HTTPClient(safe.HTTPClient)
+	}
+	return c.Connect(ctx, &safe, opts)
+}
+
+// HTTPClient returns a copy of base (http.DefaultClient when nil) whose
+// CheckRedirect refuses every redirect away from the origin of the request it
+// follows, after base's own CheckRedirect (or net/http's 10-redirect limit).
+// Connect sets it for you; otherwise give it to mcp.StreamableClientTransport
+// as HTTPClient: zero-amount Tempo
+// proofs are signed only for Streamable HTTP sessions whose client refuses
+// cross-origin redirects, since a redirect would deliver the proof to another
+// server than the endpoint whose origin vouched for the realm.
+//
+// It is not inlined, so every client it returns shares one CheckRedirect code
+// pointer, which refusesCrossOriginRedirects recognizes.
+//
+//go:noinline
+func HTTPClient(base *http.Client) *http.Client {
+	if base == nil {
+		base = http.DefaultClient
+	}
+	c := *base
+	prior := base.CheckRedirect
+	c.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if prior != nil {
+			if err := prior(req, via); err != nil {
+				return err
+			}
+		} else if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		if len(via) > 0 && tempoproof.Origin(req.URL) != tempoproof.Origin(via[0].URL) {
+			return fmt.Errorf("mpp: refusing cross-origin redirect from %q to %q", tempoproof.Origin(via[0].URL), tempoproof.Origin(req.URL))
+		}
+		return nil
+	}
+	return &c
+}
+
+// sameOriginHook is the code pointer of the CheckRedirect closure HTTPClient
+// installs; every client HTTPClient returns shares it.
+var sameOriginHook = reflect.ValueOf(HTTPClient(nil).CheckRedirect).Pointer()
+
+// refusesCrossOriginRedirects reports whether c's CheckRedirect is the one
+// HTTPClient installs, which refuses every cross-origin redirect whatever
+// hook it wraps. Any other hook could allow some origins, so it does not
+// count, nor does a nil client or hook (net/http follows redirects).
+func refusesCrossOriginRedirects(c *http.Client) bool {
+	return c != nil && c.CheckRedirect != nil && reflect.ValueOf(c.CheckRedirect).Pointer() == sameOriginHook
+}
+
+// sessionOrigin returns sessionEndpoint's endpoint when its HTTP client
+// refuses cross-origin redirects, and nil otherwise.
+func sessionOrigin(session *mcp.ClientSession) *url.URL {
+	if endpoint, redirectSafe := sessionEndpoint(session); redirectSafe {
+		return endpoint
+	}
+	return nil
+}
+
+// sessionEndpoint returns the endpoint URL of the mcp.StreamableClientTransport
+// session was connected with, or nil when it has none: other transports
+// (stdio, in-memory, SSE, a wrapped transport), a nil session, or an SDK
+// version whose layout this does not recognize, so it fails closed.
+// redirectSafe reports whether the transport's HTTP client was built by
+// HTTPClient, so it refuses cross-origin redirects; http.DefaultClient, the
+// SDK's default, follows them.
+//
+// The endpoint is what this client configured and dialed, not anything the
+// server sent, so it identifies the server the way a request URL does over
+// HTTP. The SDK does not export a session's transport, so it is read with
+// reflection; TestSessionOriginReadsStreamableEndpoint pins the layout.
+func sessionEndpoint(session *mcp.ClientSession) (endpoint *url.URL, redirectSafe bool) {
+	if session == nil {
+		return nil, false
+	}
+	conn := reflect.ValueOf(session).Elem().FieldByName("mcpConn")
+	if conn.Kind() != reflect.Interface || conn.IsNil() {
+		return nil, false
+	}
+	conn = conn.Elem()
+	if conn.Kind() != reflect.Pointer || conn.IsNil() {
+		return nil, false
+	}
+	if typ := conn.Type().Elem(); typ.PkgPath() != mcpPackage || typ.Name() != "streamableClientConn" {
+		return nil, false
+	}
+	raw := conn.Elem().FieldByName("url")
+	if raw.Kind() != reflect.String {
+		return nil, false
+	}
+	u, err := url.Parse(raw.String())
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil, false
+	}
+	// The connection sends with this client, http.DefaultClient when nil.
+	field := conn.Elem().FieldByName("client")
+	if !field.IsValid() || field.Type() != reflect.TypeFor[*http.Client]() || !field.CanAddr() {
+		return u, false
+	}
+	c := *(**http.Client)(unsafe.Pointer(field.UnsafeAddr()))
+	if c == nil {
+		c = http.DefaultClient
+	}
+	return u, refusesCrossOriginRedirects(c)
 }
