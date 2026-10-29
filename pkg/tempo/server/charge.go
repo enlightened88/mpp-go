@@ -521,9 +521,8 @@ func (i *Intent) validateTransaction(
 		if !tx.AwaitingFeePayer {
 			return mpp.ErrInvalidPayload("fee payer transaction must be marked as awaiting a fee payer")
 		}
-		if err := validateFeePayerDeadline(tx.ValidBefore, time.Now()); err != nil {
-			return err
-		}
+		// The validity deadline is checked in broadcastTransaction only when no
+		// included receipt is found, so a retry can still recover an included tx.
 		if tx.NonceKey == nil || tx.NonceKey.Cmp(tempo.ExpiringNonceKey) != 0 {
 			return mpp.ErrInvalidPayload("fee payer transaction must use the expiring nonce key")
 		}
@@ -692,8 +691,12 @@ func (i *Intent) broadcastTransaction(
 			return nil, mpp.ErrCredentialReplayed("sponsored transaction already used")
 		}
 		claimedKeys = append(claimedKeys, sponsoredClaimKey)
-		if err := validateFeePayerDeadline(tx.ValidBefore, time.Now()); err != nil {
-			return nil, err
+		// A local fee payer is covered by the check before broadcast, which skips
+		// included transactions; only a remote signer needs it before signing.
+		if i.feePayerSigner == nil {
+			if err := validateFeePayerDeadline(tx.ValidBefore, time.Now()); err != nil {
+				return nil, err
+			}
 		}
 		feeToken := validated.feeToken
 		if i.feePayerSigner != nil {
